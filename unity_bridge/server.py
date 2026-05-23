@@ -2,7 +2,7 @@
 FastAPI Unity 브릿지 서버
 uvicorn unity_bridge.server:app --host 0.0.0.0 --port 8000 --reload
 """
-import json, os, subprocess, sys
+import json, os, re, subprocess, sys
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
@@ -75,6 +75,16 @@ class SessionAnswer(BaseModel):
 
 class SessionResult(BaseModel):
     answers: list[SessionAnswer]
+
+
+class SessionCheckpoint(BaseModel):
+    answers: list[SessionAnswer]       # 이번 세션에서 이미 답한 것들
+    remaining_words: list[str]         # 아직 안 푼 단어 목록
+
+
+class AiRecommendRequest(BaseModel):
+    domain: str | None = None          # e.g. "business", "academic", "travel"
+    count: int = 10
 
 
 # ── 엔드포인트 ───────────────────────────────────────────────────────────────
@@ -204,6 +214,201 @@ def get_user_profile():
 def get_all_words():
     """전체 단어 + 레이팅 반환"""
     return load_json("output/rated_words.json")
+
+
+@app.post("/api/session/checkpoint")
+def session_checkpoint(body: SessionCheckpoint):
+    """세션 중간 정답률 → 남은 단어풀 난이도 재정렬"""
+    if not body.answers:
+        raise HTTPException(400, detail="answers가 비어있습니다.")
+
+    accuracy = sum(1 for a in body.answers if a.correct) / len(body.answers)
+    profile = load_json("output/user_profile.json")
+    rated = load_json("output/rated_words.json")
+
+    user_rating = profile["user_rating"]
+    word_rating = {w["word"]: w["rating"] for w in rated["words"]}
+    remaining = list(body.remaining_words)
+
+    if accuracy > 0.75:
+        # 어려운 단어 우선 (userRating+100 이상 앞으로)
+        hard = [w for w in remaining if word_rating.get(w, user_rating) >= user_rating + 100]
+        rest = [w for w in remaining if word_rating.get(w, user_rating) < user_rating + 100]
+        remaining = hard + rest
+        mode = "hard"
+    elif accuracy < 0.50:
+        # 쉬운 단어 우선 + 미완료 복습 단어 추가
+        easy = [w for w in remaining if word_rating.get(w, user_rating) <= user_rating - 100]
+        rest = [w for w in remaining if word_rating.get(w, user_rating) > user_rating - 100]
+        remaining = easy + rest
+
+        today_str = datetime.now().date().isoformat()
+        answered = {a.word for a in body.answers}
+        extra = [
+            w["word"] for w in rated["words"]
+            if w.get("learned") and w.get("fsrs") and w["fsrs"].get("due_date")
+            and w["fsrs"]["due_date"][:10] <= today_str
+            and w["word"] not in set(body.remaining_words)
+            and w["word"] not in answered
+        ][:10]
+        remaining = remaining + extra
+        mode = "easy"
+    else:
+        mode = "normal"
+
+    return {
+        "accuracy": round(accuracy, 3),
+        "user_rating": user_rating,
+        "mode": mode,
+        "remaining_words": remaining,
+    }
+
+
+@app.get("/api/recommend/words")
+def recommend_words(count: int = Query(default=10, ge=1, le=50)):
+    """Oxford DB에서 유저 수준 근접 미학습 단어 추천 (약점 구간 가중치)"""
+    if not (ROOT / "output/user_profile.json").exists():
+        raise HTTPException(404, detail="온보딩 미완료")
+    if not (ROOT / "models/refined_db.json").exists():
+        raise HTTPException(404, detail="Oxford DB 없음 (AI3 미실행)")
+
+    profile = load_json("output/user_profile.json")
+    rated = load_json("output/rated_words.json")
+    db = load_json("models/refined_db.json")
+
+    user_rating = profile["user_rating"]
+    all_user_words = {w["word"] for w in rated["words"]}
+
+    # 약점 구간: Again(rating=1) 응답이 많은 단어들의 rating 평균
+    weak_ratings = [
+        w["rating"] for w in rated["words"]
+        for r in w.get("review_history", [])
+        if r[1] == 1
+    ]
+    weak_center = int(sum(weak_ratings) / len(weak_ratings)) if weak_ratings else user_rating
+
+    candidates = [
+        w for w in db["words"]
+        if w["word"] not in all_user_words
+        and abs(w["rating_refined"] - user_rating) <= 150
+    ]
+
+    def _score(w):
+        proximity = abs(w["rating_refined"] - user_rating)
+        weak_boost = max(0, 100 - abs(w["rating_refined"] - weak_center))
+        return proximity - weak_boost
+
+    candidates.sort(key=_score)
+
+    return {
+        "user_rating": user_rating,
+        "weak_center": weak_center,
+        "count": min(count, len(candidates)),
+        "words": [
+            {"word": w["word"], "rating": w["rating_refined"], "pos": w.get("pos")}
+            for w in candidates[:count]
+        ],
+    }
+
+
+@app.post("/api/recommend/ai")
+def recommend_ai(body: AiRecommendRequest):
+    """Claude API로 유저 맞춤 단어 추천 → rated_words.json 자동 편입"""
+    import anthropic
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise HTTPException(500, detail="ANTHROPIC_API_KEY 없음")
+    if not (ROOT / "output/user_profile.json").exists():
+        raise HTTPException(404, detail="온보딩 미완료")
+
+    profile = load_json("output/user_profile.json")
+    rated = load_json("output/rated_words.json")
+
+    user_rating = profile["user_rating"]
+    learned_words = [w["word"] for w in rated["words"] if w.get("learned")]
+
+    weak_ratings = [
+        w["rating"] for w in rated["words"]
+        for r in w.get("review_history", []) if r[1] == 1
+    ]
+    weak_range = None
+    if weak_ratings:
+        wc = int(sum(weak_ratings) / len(weak_ratings))
+        weak_range = [wc - 100, wc + 100]
+
+    cefr = ("A1" if user_rating < 175 else "A2" if user_rating < 325 else
+            "B1" if user_rating < 475 else "B2" if user_rating < 625 else "C1")
+
+    user_ctx = {
+        "user_rating": user_rating,
+        "cefr_level": cefr,
+        "domain": body.domain,
+        "weak_rating_range": weak_range,
+        "recently_learned": learned_words[-20:],
+        "count": body.count,
+    }
+
+    client = anthropic.Anthropic(api_key=api_key)
+    resp = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        system="당신은 영어 단어 학습 추천 전문가입니다. 반드시 JSON만 반환하세요.",
+        messages=[{
+            "role": "user",
+            "content": (
+                f"다음 유저 프로필을 분석해서 영어 단어 {body.count}개를 추천하세요.\n"
+                f"유저 프로필: {json.dumps(user_ctx, ensure_ascii=False)}\n\n"
+                '응답 형식 (JSON만):\n'
+                '{"recommended": [{"word": "...", "reason": "...", "cefr": "B2", "rating": 550}]}'
+            ),
+        }],
+    )
+
+    raw = resp.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    raw = raw.strip()
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            result = json.loads(m.group())
+        else:
+            raise HTTPException(500, detail="Claude 응답 파싱 실패")
+
+    all_user_words = {w["word"] for w in rated["words"]}
+    added = []
+    for item in result.get("recommended", []):
+        word = item.get("word", "").lower().strip()
+        if not word or word in all_user_words:
+            continue
+        rated["words"].append({
+            "word": word,
+            "pos": None,
+            "meaning": None,
+            "rating": item.get("rating", user_rating),
+            "source": "ai_recommended",
+            "confidence": 0.8,
+            "learned": False,
+            "fsrs": {
+                "stability": None, "difficulty": None, "due_date": None,
+                "review_count": 0, "last_rating": None, "state": "new",
+                "first_exposure": False,
+            },
+        })
+        all_user_words.add(word)
+        added.append({"word": word, "rating": item.get("rating", user_rating),
+                      "reason": item.get("reason"), "cefr": item.get("cefr")})
+
+    if added:
+        rated["total_words"] = len(rated["words"])
+        save_json("output/rated_words.json", rated)
+
+    return {"added_count": len(added), "words": added}
 
 
 # ── 단독 실행 테스트 ─────────────────────────────────────────────────────────

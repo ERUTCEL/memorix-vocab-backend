@@ -6,6 +6,7 @@ AI4 — 일별 학습 스케줄러 (FSRS + IRT)
 """
 import os, sys, json, math, logging, argparse
 from datetime import datetime, timedelta, date
+from scipy.optimize import minimize
 
 os.makedirs("output", exist_ok=True)
 logging.basicConfig(
@@ -183,6 +184,101 @@ def get_optimizer_reviews(rated_words: dict) -> list:
     ]
 
 
+# ── FSRS Weight Optimizer ────────────────────────────────────────────────────
+
+def _sim_stability(history: list, w: list) -> list[tuple]:
+    """카드 리뷰 이력으로 각 리뷰 시점의 (R_predicted, correct) 생성."""
+    if len(history) < 2:
+        return []
+    initial_rating = history[0][1]
+    S = max(0.01, w[initial_rating - 1])
+    D = max(1.0, min(10.0, w[4] - (initial_rating - 3) * w[5]))
+    results = []
+    for elapsed, rating in history[1:]:
+        R = retrievability(elapsed, S)
+        correct = rating > 1
+        results.append((R, correct))
+        if rating == 1:
+            new_S = (
+                w[11] * (D ** -w[12])
+                * ((S + 1.0) ** w[13] - 1.0)
+                * math.exp(w[14] * (1.0 - R))
+            )
+        else:
+            hp = w[15] if rating == 2 else 1.0
+            eb = w[16] if rating == 4 else 1.0
+            new_S = S * (
+                math.exp(w[8]) * (11.0 - D) * (S ** -w[9])
+                * (math.exp(w[10] * (1.0 - R)) - 1.0)
+                * hp * eb
+            ) + S
+        S = min(max(new_S, 0.01), MAX_STABILITY)
+        delta = w[6] * (rating - 3)
+        new_D = D - delta
+        new_D = w[7] * (w[4] - 0 * w[5]) + (1.0 - w[7]) * new_D
+        D = max(1.0, min(10.0, new_D))
+    return results
+
+
+def _fsrs_loss(w_flat: list, histories: list) -> float:
+    """FSRS BCE 손실: Σ -[correct*log(R) + (1-correct)*log(1-R)]"""
+    w = list(w_flat)
+    total, count = 0.0, 0
+    for history in histories:
+        for R, correct in _sim_stability(history, w):
+            R = max(1e-9, min(1 - 1e-9, R))
+            total += -(math.log(R) if correct else math.log(1 - R))
+            count += 1
+    return total / max(count, 1)
+
+
+def optimize_weights(rated_words_path: str = "output/rated_words.json", min_cards: int = 30) -> list:
+    """리뷰 이력 기반 gradient descent로 FSRS_WEIGHTS 최적화."""
+    if not os.path.exists(rated_words_path):
+        logger.error("rated_words.json 없음")
+        return list(FSRS_WEIGHTS)
+
+    with open(rated_words_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    histories = [
+        w["review_history"] for w in data["words"]
+        if len(w.get("review_history", [])) >= 2
+    ]
+
+    if len(histories) < min_cards:
+        logger.warning(f"최적화 데이터 부족: {len(histories)}개 (최소 {min_cards}개 필요)")
+        return list(FSRS_WEIGHTS)
+
+    logger.info(f"FSRS 최적화 시작: {len(histories)}개 카드")
+
+    bounds = [
+        (0.1, 5.0), (0.5, 5.0), (1.0, 10.0), (5.0, 25.0),  # w[0]-w[3]
+        (3.0, 10.0), (0.1, 3.0),                              # w[4]-w[5]
+        (0.1, 5.0), (0.01, 0.5),                              # w[6]-w[7]
+        (0.5, 5.0), (0.01, 1.0), (0.1, 5.0),                 # w[8]-w[10]
+        (0.5, 5.0), (0.01, 1.0), (0.01, 1.0),                # w[11]-w[13]
+        (1.0, 5.0), (0.01, 0.5), (1.0, 5.0),                 # w[14]-w[16]
+    ]
+
+    result = minimize(
+        _fsrs_loss,
+        x0=list(FSRS_WEIGHTS[:17]),
+        args=(histories,),
+        method="L-BFGS-B",
+        bounds=bounds,
+        options={"maxiter": 300, "ftol": 1e-7},
+    )
+
+    new_weights = list(result.x) + list(FSRS_WEIGHTS[17:])
+    if result.success:
+        logger.info(f"최적화 완료: loss={result.fun:.4f}")
+    else:
+        logger.warning(f"수렴 불완전: {result.message}")
+
+    return new_weights
+
+
 # ── Oxford DB 보충 ───────────────────────────────────────────────────────────
 
 def get_oxford_supplement(user_rating: int, count: int, exclude_words: set) -> list:
@@ -198,6 +294,20 @@ def get_oxford_supplement(user_rating: int, count: int, exclude_words: set) -> l
     return candidates[:count]
 
 
+# ── 복습:신규 비율 계산 ──────────────────────────────────────────────────────
+
+def calculate_review_ratio(user_profile: dict, review_due_count: int) -> float:
+    """복습 비율(0.0~1.0) 반환. 기본 40:60, 상황별 자동 조정."""
+    if review_due_count == 0 or user_profile.get("total_sessions", 0) == 0:
+        return 0.0  # 첫날 또는 복습 없음 → 신규만
+    if review_due_count >= 50:
+        return 0.6  # 복습 밀림 → 60:40
+    last_acc = user_profile.get("last_session_accuracy")
+    if last_acc is not None and last_acc < 0.50:
+        return 0.5  # 최근 정답률 저조 → 50:50
+    return 0.4  # 기본 40:60
+
+
 # ── 일별 스케줄 생성 ─────────────────────────────────────────────────────────
 
 def build_daily_schedule(rated_words: dict, user_profile: dict, daily_limit: int, today: date) -> dict:
@@ -205,17 +315,23 @@ def build_daily_schedule(rated_words: dict, user_profile: dict, daily_limit: int
     words = rated_words["words"]
     today_str = today.isoformat()
 
-    # 복습 단어: due_date <= today, learned=True (learning 상태 포함)
+    # 복습 단어: due_date <= today, learned=True — retrievability 낮은 순(망각 위험 높은 것 먼저)
     review_due = sorted(
         [
             w for w in words
             if w.get("learned") and w.get("fsrs") and w["fsrs"].get("due_date")
             and w["fsrs"]["due_date"][:10] <= today_str
         ],
-        key=lambda w: w["fsrs"]["due_date"],
+        key=lambda w: retrievability(
+            max(0, (today - date.fromisoformat(
+                w["fsrs"].get("last_review", today.isoformat())[:10]
+            )).days),
+            w["fsrs"].get("stability") or 1.0,
+        ),
     )
 
-    review_target = int(daily_limit * 0.4)
+    review_ratio = calculate_review_ratio(user_profile, len(review_due))
+    review_target = int(daily_limit * review_ratio)
     if len(review_due) > daily_limit:
         logger.warning(f"복습 단어({len(review_due)}) > daily_limit({daily_limit}). 신규 0.")
         review_target = daily_limit
@@ -274,6 +390,8 @@ def process_session_result(session_path: str) -> dict:
 
     word_map = {w["word"]: w for w in rated_words["words"]}
     k = get_k_factor(user_profile["total_sessions"])
+    correct_count = 0
+    total_correct_tracked = 0
 
     for result in session.get("answers", []):
         word = result.get("word", "").lower().strip()
@@ -288,16 +406,28 @@ def process_session_result(session_path: str) -> dict:
         if not card.get("learned"):
             card["fsrs"] = init_fsrs_card(rating_given, today)
             card["learned"] = True
+            card["review_history"] = [[0, rating_given]]
         elif card["fsrs"].get("state") == "learning":
             # 학습 단계 재제출 — full review 공식 대신 init으로 재평가
+            elapsed = (today - date.fromisoformat(
+                card["fsrs"]["last_review"][:10]
+            )).days
             prev_count = card["fsrs"]["review_count"]
             card["fsrs"] = init_fsrs_card(rating_given, today)
             card["fsrs"]["review_count"] = prev_count + 1
-            card["fsrs"]["first_exposure"] = False  # 첫 노출이 아님
+            card["fsrs"]["first_exposure"] = False
+            card.setdefault("review_history", []).append([elapsed, rating_given])
         else:
+            elapsed = (today - date.fromisoformat(
+                card["fsrs"]["last_review"][:10]
+            )).days
             card["fsrs"] = process_review(card["fsrs"], rating_given, today)
+            card.setdefault("review_history", []).append([elapsed, rating_given])
 
         if correct is not None:
+            total_correct_tracked += 1
+            if correct:
+                correct_count += 1
             user_profile["user_rating"] = update_user_rating(
                 user_profile["user_rating"], card["rating"], correct, k
             )
@@ -306,6 +436,8 @@ def process_session_result(session_path: str) -> dict:
     user_profile["k_factor"] = get_k_factor(user_profile["total_sessions"])
     user_profile["last_updated"] = today.isoformat()
     user_profile["rating_history"].append(user_profile["user_rating"])
+    if total_correct_tracked > 0:
+        user_profile["last_session_accuracy"] = round(correct_count / total_correct_tracked, 3)
 
     save_json("output/rated_words.json", rated_words)
     save_json("output/user_profile.json", user_profile)
@@ -399,10 +531,15 @@ if __name__ == "__main__":
     parser.add_argument("--days", type=int, default=1, help="생성할 일수")
     parser.add_argument("--daily-limit", type=int, default=100, help="하루 최대 단어 수")
     parser.add_argument("--submit-result", metavar="PATH", help="세션 결과 JSON 경로")
+    parser.add_argument("--optimize", action="store_true", help="FSRS weights 최적화")
     parser.add_argument("--test", action="store_true", help="단독 기능 테스트")
     args = parser.parse_args()
 
     if args.test:
         run_test()
+    elif args.optimize:
+        new_weights = optimize_weights()
+        save_json("output/optimized_weights.json", {"weights": new_weights})
+        print(f"[AI4] 최적화 완료 → output/optimized_weights.json")
     else:
         main(args)
