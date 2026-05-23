@@ -2,7 +2,7 @@
 AI2 — 유저 CSV 미등록 단어 레이팅 예측
 Oxford DB 임베딩 KNN + (저신뢰 시) Claude API 검증.
 """
-import os, sys, json, math, logging, argparse, pickle
+import os, sys, json, math, logging, argparse, pickle, re
 from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
@@ -114,7 +114,16 @@ def api_verify(low_conf_words: list[dict], client: anthropic.Anthropic, batch_si
                 raw = raw.split("```")[1]
                 if raw.startswith("json"):
                     raw = raw[4:]
-            batch_result = json.loads(raw.strip())
+            raw = raw.strip()
+            try:
+                batch_result = json.loads(raw)
+            except json.JSONDecodeError:
+                # trailing comma / 주석 등으로 파싱 실패 시 {...} 구간만 추출해 재시도
+                m = re.search(r"\{.*\}", raw, re.DOTALL)
+                if m:
+                    batch_result = json.loads(m.group())
+                else:
+                    raise
             verified.update(batch_result)
         except Exception as exc:
             logger.error(f"API 검증 배치 {batch_no} 실패: {exc}")
