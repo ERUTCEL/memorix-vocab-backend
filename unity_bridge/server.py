@@ -61,6 +61,12 @@ class QuizSubmit(BaseModel):
     answers: list[QuizAnswer]
 
 
+class CatAnswer(BaseModel):
+    word: str
+    correct: bool
+    response_time_ms: int | None = None
+
+
 class SessionAnswer(BaseModel):
     word: str
     correct: bool | None = None
@@ -134,6 +140,25 @@ def submit_quiz(body: QuizSubmit):
         raise HTTPException(500, detail=result.stderr or "퀴즈 결과 처리 실패")
 
     return load_json("output/user_profile.json")
+
+
+@app.post("/api/onboarding/cat/start")
+def cat_start():
+    """CAT 온보딩 시작 → 첫 문항 반환"""
+    result = run_script("scripts/ai1_onboarding.py", "--cat-start")
+    if result.returncode != 0:
+        raise HTTPException(500, detail=result.stderr or "CAT 시작 실패")
+    return load_json("output/cat_response.json")
+
+
+@app.post("/api/onboarding/cat/answer")
+def cat_answer(body: CatAnswer):
+    """CAT 한 문항 제출 → 다음 문항 or 완료 반환"""
+    save_json("input/cat_answer.json", body.model_dump())
+    result = run_script("scripts/ai1_onboarding.py", "--cat-answer", "input/cat_answer.json")
+    if result.returncode != 0:
+        raise HTTPException(500, detail=result.stderr or "CAT 응답 처리 실패")
+    return load_json("output/cat_response.json")
 
 
 @app.get("/api/schedule/today")

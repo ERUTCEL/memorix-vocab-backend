@@ -7,7 +7,7 @@ import os, sys, json, math, logging, argparse, random
 from datetime import datetime
 
 import numpy as np
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, minimize_scalar
 
 os.makedirs("output", exist_ok=True)
 logging.basicConfig(
@@ -28,6 +28,14 @@ BUCKETS = {
     "C1": (650, 800, 700),
 }
 QUESTIONS_PER_BUCKET = 20
+
+CAT_MAX_QUESTIONS = 25
+CAT_MIN_QUESTIONS = 8
+CAT_SE_THRESHOLD = 75.0
+CAT_PRIOR_MEAN = 400.0
+CAT_PRIOR_SD = 200.0
+CAT_STATE_PATH = "output/cat_state.json"
+CAT_RESPONSE_PATH = "output/cat_response.json"
 
 
 # ── IRT / Elo 유틸 ───────────────────────────────────────────────────────────
@@ -172,6 +180,172 @@ def process_result(answers_path: str) -> None:
     print(f"[AI1] userRating 초기화 완료: {user_rating}")
 
 
+# ── CAT 함수 ─────────────────────────────────────────────────────────────────
+
+def _select_next_item(theta: float, words: list[dict], asked: set) -> dict | None:
+    available = [w for w in words if w["word"] not in asked]
+    if not available:
+        return None
+    return min(available, key=lambda w: abs(w["rating"] - theta))
+
+
+def _map_theta(responses: list[dict], scale: float = 150.0) -> float:
+    """MAP 추정: 가우시안 prior(μ=400, σ=200) + 로그우도 최대화.
+    MLE 대비 초기 응답 불안정(θ→경계) 방지."""
+    if not responses:
+        return CAT_PRIOR_MEAN
+
+    def neg_posterior(theta):
+        prior = (theta - CAT_PRIOR_MEAN) ** 2 / (2 * CAT_PRIOR_SD ** 2)
+        ll = 0.0
+        for r in responses:
+            p = sigmoid_irt(theta, r["rating"], scale)
+            p = max(1e-9, min(1 - 1e-9, p))
+            ll += math.log(p) if r["correct"] else math.log(1 - p)
+        return -ll + prior
+
+    return float(minimize_scalar(neg_posterior, bounds=(50.0, 850.0), method="bounded").x)
+
+
+def _se_theta(theta: float, responses: list[dict], scale: float = 150.0) -> float:
+    """Fisher information + prior precision 기반 SE."""
+    likelihood_info = sum(
+        sigmoid_irt(theta, r["rating"], scale) * (1 - sigmoid_irt(theta, r["rating"], scale)) / (scale ** 2)
+        for r in responses
+    )
+    prior_info = 1.0 / (CAT_PRIOR_SD ** 2)
+    return 1.0 / math.sqrt(likelihood_info + prior_info)
+
+
+def _save_cat_response(response: dict) -> None:
+    os.makedirs("output", exist_ok=True)
+    with open(CAT_RESPONSE_PATH, "w", encoding="utf-8") as f:
+        json.dump(response, f, ensure_ascii=False, indent=2)
+
+
+def _finalize_cat(theta: float, se: float, q_num: int, state: dict) -> None:
+    state["done"] = True
+    with open(CAT_STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+    user_rating = round(theta)
+    profile = {
+        "user_id": "user_001",
+        "user_rating": user_rating,
+        "rating_history": [user_rating],
+        "k_factor": get_k_factor(0),
+        "total_sessions": 0,
+        "onboarding_completed": True,
+        "onboarding_questions": q_num,
+        "onboarding_final_se": round(se, 1),
+        "created_at": datetime.now().strftime("%Y-%m-%d"),
+        "last_updated": datetime.now().strftime("%Y-%m-%d"),
+    }
+    with open("output/user_profile.json", "w", encoding="utf-8") as f:
+        json.dump(profile, f, ensure_ascii=False, indent=2)
+
+    _save_cat_response({"done": True, "question_num": q_num, "user_profile": profile})
+    print(f"[AI1-CAT] 완료: {q_num}문항, userRating={user_rating}, SE={se:.1f}")
+
+
+def cat_start(rated_words_path: str = "output/rated_words.json") -> None:
+    if not os.path.exists(rated_words_path):
+        logger.error("rated_words.json 없음. AI2 먼저 실행하세요.")
+        sys.exit(1)
+
+    with open(rated_words_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    theta = 400.0
+    words = [{"word": w["word"], "rating": w["rating"]} for w in data["words"]]
+    first = _select_next_item(theta, words, set())
+
+    if first is None:
+        logger.error("단어 풀이 비어있음")
+        sys.exit(1)
+
+    state = {
+        "theta": theta,
+        "se": 999.0,
+        "responses": [],
+        "asked_words": [first["word"]],
+        "question_num": 1,
+        "done": False,
+    }
+    os.makedirs("output", exist_ok=True)
+    with open(CAT_STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+    _save_cat_response({
+        "done": False,
+        "question_num": 1,
+        "max_questions": CAT_MAX_QUESTIONS,
+        "theta": round(theta),
+        "word": first["word"],
+        "rating": first["rating"],
+    })
+    logger.info(f"CAT 시작 θ={theta:.0f}, 첫 문항: {first['word']} (난이도={first['rating']})")
+    print(f"[AI1-CAT] 시작: 첫 문항={first['word']}")
+
+
+def cat_answer(answer_path: str, rated_words_path: str = "output/rated_words.json") -> None:
+    for path, name in [
+        (CAT_STATE_PATH, "cat_state.json"),
+        (rated_words_path, "rated_words.json"),
+        (answer_path, answer_path),
+    ]:
+        if not os.path.exists(path):
+            logger.error(f"{name} 없음.")
+            sys.exit(1)
+
+    with open(CAT_STATE_PATH, "r", encoding="utf-8") as f:
+        state = json.load(f)
+    with open(rated_words_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    with open(answer_path, "r", encoding="utf-8") as f:
+        answer = json.load(f)
+
+    word_rating_map = {w["word"]: w["rating"] for w in data["words"]}
+    word = answer["word"]
+    correct = bool(answer["correct"])
+    rating = word_rating_map.get(word, round(state["theta"]))
+
+    state["responses"].append({"word": word, "rating": rating, "correct": correct})
+
+    new_theta = _map_theta(state["responses"])
+    new_se = _se_theta(new_theta, state["responses"])
+    state["theta"] = new_theta
+    state["se"] = new_se
+    q_num = state["question_num"]
+
+    logger.info(f"Q{q_num}: {word} ({'O' if correct else 'X'}) → θ={new_theta:.0f}, SE={new_se:.1f}")
+
+    if q_num >= CAT_MAX_QUESTIONS or (q_num >= CAT_MIN_QUESTIONS and new_se < CAT_SE_THRESHOLD):
+        _finalize_cat(new_theta, new_se, q_num, state)
+        return
+
+    state["question_num"] += 1
+    words = [{"word": w["word"], "rating": w["rating"]} for w in data["words"]]
+    next_item = _select_next_item(new_theta, words, set(state["asked_words"]))
+
+    if next_item is None:
+        _finalize_cat(new_theta, new_se, q_num, state)
+        return
+
+    state["asked_words"].append(next_item["word"])
+    with open(CAT_STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+    _save_cat_response({
+        "done": False,
+        "question_num": state["question_num"],
+        "max_questions": CAT_MAX_QUESTIONS,
+        "theta": round(new_theta),
+        "word": next_item["word"],
+        "rating": next_item["rating"],
+    })
+
+
 def estimate_user_rating(centers: list, accuracies: list, scale: float = 150.0) -> int:
     """이분탐색으로 P=0.66이 되는 θ 추정. curve_fit 실패 시 간단한 선형 보간 사용."""
     try:
@@ -255,6 +429,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AI1: Onboarding 퀴즈 & userRating 초기화")
     parser.add_argument("--generate-quiz", action="store_true", help="퀴즈 단어 샘플링 및 저장")
     parser.add_argument("--process-result", metavar="PATH", help="퀴즈 결과 JSON 처리")
+    parser.add_argument("--cat-start", action="store_true", help="CAT 온보딩 시작 → 첫 문항")
+    parser.add_argument("--cat-answer", metavar="PATH", help="CAT 한 문항 제출 → 다음 문항 or 완료")
     parser.add_argument("--test", action="store_true", help="단독 기능 테스트")
     args = parser.parse_args()
 
@@ -264,6 +440,9 @@ if __name__ == "__main__":
         generate_quiz()
     elif args.process_result:
         process_result(args.process_result)
+    elif args.cat_start:
+        cat_start()
+    elif args.cat_answer:
+        cat_answer(args.cat_answer)
     else:
-        # 기본: 퀴즈 생성
         generate_quiz()
