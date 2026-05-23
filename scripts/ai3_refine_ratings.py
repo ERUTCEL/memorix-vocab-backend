@@ -2,7 +2,7 @@
 AI3 — Oxford DB 레이팅 세분화
 최초 1회 실행. models/refined_db.json 과 models/embeddings_cache.pkl 생성.
 """
-import os, sys, json, math, logging, argparse, pickle
+import os, sys, json, math, logging, argparse, pickle, re
 from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
@@ -93,8 +93,28 @@ def batch_abstraction_scores(words: list[str], client: anthropic.Anthropic, batc
                 raw = raw.split("```")[1]
                 if raw.startswith("json"):
                     raw = raw[4:]
-            scores = json.loads(raw.strip())
-            all_scores.update(scores)
+            raw = raw.strip()
+            # 주석·trailing comma 제거 후 파싱, 실패 시 외부 {} 추출
+            def _clean(s):
+                s = re.sub(r"//[^\n]*", "", s)
+                s = re.sub(r",\s*([\}\]])", r"\1", s)
+                return s.strip()
+            parsed = None
+            for candidate in [raw, _clean(raw)]:
+                try:
+                    parsed = json.loads(candidate)
+                    break
+                except json.JSONDecodeError:
+                    m = re.search(r"\{.*\}", candidate, re.DOTALL)
+                    if m:
+                        try:
+                            parsed = json.loads(_clean(m.group()))
+                            break
+                        except json.JSONDecodeError:
+                            pass
+            if parsed is None:
+                raise ValueError("JSON 파싱 실패")
+            all_scores.update(parsed)
         except Exception as exc:
             logger.error(f"배치 {batch_no} API 실패: {exc}. fallback 사용.")
             for w in batch:

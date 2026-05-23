@@ -74,6 +74,39 @@ def knn_predict(words: list[str], cache: dict, k: int = 5) -> list[dict]:
     return results
 
 
+# ── JSON 복구 파서 ───────────────────────────────────────────────────────────
+
+def _parse_json_robust(raw: str) -> dict | None:
+    """Claude 응답 JSON을 단계적으로 복구 시도. 실패 시 None 반환."""
+    def _clean(s: str) -> str:
+        s = re.sub(r"//[^\n]*", "", s)           # // 주석 제거
+        s = re.sub(r"/\*.*?\*/", "", s, flags=re.DOTALL)  # /* */ 주석 제거
+        s = re.sub(r",\s*([\}\]])", r"\1", s)    # trailing comma 제거
+        return s.strip()
+
+    # 1차: 그대로 파싱
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # 2차: 주석·trailing comma 제거 후 파싱
+    try:
+        return json.loads(_clean(raw))
+    except json.JSONDecodeError:
+        pass
+
+    # 3차: 외부 {...} 추출 후 정리하여 파싱
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        try:
+            return json.loads(_clean(m.group()))
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
 # ── Claude API 저신뢰 검증 ───────────────────────────────────────────────────
 
 def api_verify(low_conf_words: list[dict], client: anthropic.Anthropic, batch_size: int = 50) -> dict:
@@ -115,15 +148,9 @@ def api_verify(low_conf_words: list[dict], client: anthropic.Anthropic, batch_si
                 if raw.startswith("json"):
                     raw = raw[4:]
             raw = raw.strip()
-            try:
-                batch_result = json.loads(raw)
-            except json.JSONDecodeError:
-                # trailing comma / 주석 등으로 파싱 실패 시 {...} 구간만 추출해 재시도
-                m = re.search(r"\{.*\}", raw, re.DOTALL)
-                if m:
-                    batch_result = json.loads(m.group())
-                else:
-                    raise
+            batch_result = _parse_json_robust(raw)
+            if batch_result is None:
+                raise ValueError("JSON 파싱 실패 (모든 복구 시도 실패)")
             verified.update(batch_result)
         except Exception as exc:
             logger.error(f"API 검증 배치 {batch_no} 실패: {exc}")
