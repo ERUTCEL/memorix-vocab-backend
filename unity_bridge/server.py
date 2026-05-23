@@ -43,9 +43,14 @@ def save_json(rel_path: str, data: dict) -> None:
 
 
 def run_script(*args: str, timeout: int = 300) -> subprocess.CompletedProcess:
-    """프로젝트 루트에서 scripts/ 스크립트 실행."""
+    """프로젝트 루트에서 scripts/ 스크립트 실행. timeout 포함 모든 예외를 HTTPException으로 변환."""
     cmd = [sys.executable] + list(args)
-    return subprocess.run(cmd, capture_output=True, text=True, cwd=str(ROOT), timeout=timeout)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, cwd=str(ROOT), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(500, detail=f"{args[0]} 타임아웃 ({timeout}s 초과)")
+    except Exception as exc:
+        raise HTTPException(500, detail=f"{args[0]} 실행 오류: {exc}")
 
 
 # ── 요청 모델 ────────────────────────────────────────────────────────────────
@@ -112,7 +117,7 @@ async def upload_csv(file: UploadFile = File(...)):
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.write_bytes(content)
 
-    result = run_script("scripts/ai2_rate_csv.py", "--input", "input/user_words.csv", timeout=120)
+    result = run_script("scripts/ai2_rate_csv.py", "--input", "input/user_words.csv", timeout=600)
     if result.returncode != 0:
         raise HTTPException(500, detail=result.stderr or "AI2 실행 실패")
 
