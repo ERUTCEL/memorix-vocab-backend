@@ -106,6 +106,10 @@ class AiRecommendRequest(BaseModel):
     count: int = 10
 
 
+class ScheduleRecommendRequest(BaseModel):
+    daily_minutes: int = 30
+
+
 # ── 엔드포인트 ───────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
@@ -196,10 +200,24 @@ def get_today_schedule(
     total_words: int | None = Query(default=None, ge=1),
     days: int | None = Query(default=None, ge=1),
 ):
-    """오늘의 학습 스케줄 반환. total_words+days 모두 있으면 daily_limit 자동 계산."""
-    if total_words is not None and days is not None:
+    """오늘의 학습 스케줄 반환. study_plan confirmed이면 daily_limit 자동 적용."""
+    from datetime import date as _date
+
+    plan_applied = False
+    if (ROOT / "output/user_profile.json").exists():
+        profile = load_json("output/user_profile.json")
+        plan = profile.get("study_plan")
+        if plan and plan.get("confirmed"):
+            start = _date.fromisoformat(plan["start_date"])
+            idx = (_date.today() - start).days
+            daily_plan = plan["daily_plan"]
+            daily_limit = daily_plan[min(idx, len(daily_plan) - 1)]
+            plan_applied = True
+
+    if not plan_applied and total_words is not None and days is not None:
         daily_new = total_words / days
         daily_limit = round(daily_new / (1 - 0.4))
+
     result = run_script(
         "scripts/ai4_scheduler.py",
         "--today-only",
@@ -208,6 +226,110 @@ def get_today_schedule(
     if result.returncode != 0:
         raise HTTPException(500, detail=result.stderr or "스케줄 생성 실패")
     return load_json("output/daily_schedule.json")
+
+
+@app.post("/api/schedule/recommend")
+def schedule_recommend(body: ScheduleRecommendRequest):
+    """유저 데이터 분석 후 Claude API로 학습 플랜 추천 → study_plan 저장"""
+    import anthropic
+    from datetime import date as _date
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise HTTPException(500, detail="ANTHROPIC_API_KEY 없음")
+    for path, label in [
+        ("output/rated_words.json", "rated_words.json"),
+        ("output/user_profile.json", "user_profile.json"),
+    ]:
+        if not (ROOT / path).exists():
+            raise HTTPException(404, detail=f"{label} 없음 (온보딩 미완료)")
+
+    rated = load_json("output/rated_words.json")
+    profile = load_json("output/user_profile.json")
+
+    # 단어 난이도 분포 집계
+    buckets = {"A1": 0, "A2": 0, "B1": 0, "B2": 0, "C1": 0}
+    for w in rated["words"]:
+        r = w.get("rating", 0)
+        if r < 175:
+            buckets["A1"] += 1
+        elif r < 325:
+            buckets["A2"] += 1
+        elif r < 475:
+            buckets["B1"] += 1
+        elif r < 625:
+            buckets["B2"] += 1
+        else:
+            buckets["C1"] += 1
+
+    total_words_count = len(rated["words"])
+    words_per_min = 2
+    daily_capacity = body.daily_minutes * words_per_min
+
+    user_ctx = {
+        "total_words": total_words_count,
+        "daily_minutes": body.daily_minutes,
+        "daily_capacity": daily_capacity,
+        "user_rating": profile["user_rating"],
+        "total_sessions": profile.get("total_sessions", 0),
+        "cefr_level": (
+            "A1" if profile["user_rating"] < 175 else
+            "A2" if profile["user_rating"] < 325 else
+            "B1" if profile["user_rating"] < 475 else
+            "B2" if profile["user_rating"] < 625 else "C1"
+        ),
+        "difficulty_distribution": buckets,
+    }
+
+    client = anthropic.Anthropic(api_key=api_key)
+    resp = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=512,
+        system="당신은 영어 학습 플랜 전문가입니다. 반드시 JSON만 반환하세요.",
+        messages=[{
+            "role": "user",
+            "content": (
+                f"다음 유저 데이터를 분석해서 최적 학습 플랜을 추천하세요.\n"
+                f"유저 데이터: {json.dumps(user_ctx, ensure_ascii=False)}\n\n"
+                "응답 형식 (JSON만, 설명 없이):\n"
+                '{"recommended_days": 10, "recommended_daily_limit": 60, '
+                '"daily_plan": [70, 70, 65, 60, 60, 55, 55, 50, 50, 50], '
+                '"reason": "추천 이유 한 줄"}'
+            ),
+        }],
+    )
+
+    raw = resp.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    raw = raw.strip()
+    try:
+        plan_data = json.loads(raw)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            plan_data = json.loads(m.group())
+        else:
+            raise HTTPException(500, detail="Claude 응답 파싱 실패")
+
+    # study_plan 저장
+    profile["study_plan"] = {
+        "start_date": _date.today().isoformat(),
+        "daily_plan": plan_data["daily_plan"],
+        "confirmed": True,
+    }
+    save_json("output/user_profile.json", profile)
+
+    return {
+        "recommended_days": plan_data["recommended_days"],
+        "recommended_daily_limit": plan_data["recommended_daily_limit"],
+        "daily_plan": plan_data["daily_plan"],
+        "reason": plan_data.get("reason", ""),
+        "total_words": total_words_count,
+        "user_rating": profile["user_rating"],
+    }
 
 
 @app.post("/api/session/result")
