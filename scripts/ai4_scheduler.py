@@ -396,6 +396,7 @@ def process_session_result(session_path: str) -> dict:
 
     word_map = {w["word"]: w for w in rated_words["words"]}
     k = get_k_factor(user_profile["total_sessions"])
+    checkpoint_answered = set(user_profile.get("checkpoint_answered", []))
     correct_count = 0
     total_correct_tracked = 0
 
@@ -434,9 +435,11 @@ def process_session_result(session_path: str) -> dict:
             total_correct_tracked += 1
             if correct:
                 correct_count += 1
-            user_profile["user_rating"] = update_user_rating(
-                user_profile["user_rating"], card["rating"], correct, k
-            )
+            # checkpoint에서 이미 IRT 반영된 단어는 중복 업데이트 건너뜀
+            if word not in checkpoint_answered:
+                user_profile["user_rating"] = update_user_rating(
+                    user_profile["user_rating"], card["rating"], correct, k
+                )
 
     user_profile["total_sessions"] += 1
     user_profile["k_factor"] = get_k_factor(user_profile["total_sessions"])
@@ -444,6 +447,7 @@ def process_session_result(session_path: str) -> dict:
     user_profile["rating_history"].append(user_profile["user_rating"])
     if total_correct_tracked > 0:
         user_profile["last_session_accuracy"] = round(correct_count / total_correct_tracked, 3)
+    user_profile["checkpoint_answered"] = []
 
     save_json("output/rated_words.json", rated_words)
     save_json("output/user_profile.json", user_profile)

@@ -256,13 +256,17 @@ def session_checkpoint(body: SessionCheckpoint):
     word_rating = {w["word"]: w["rating"] for w in rated["words"]}
     remaining = list(body.remaining_words)
 
-    # IRT 실시간 업데이트
+    # IRT 실시간 업데이트 + checkpoint_answered 누적 저장
     k = _get_k(profile.get("total_sessions", 0))
+    newly_answered = []
     for a in body.answers:
         if a.correct is not None:
             wr = word_rating.get(a.word, user_rating)
             user_rating = _irt_update(user_rating, wr, a.correct, k)
+            newly_answered.append(a.word)
     profile["user_rating"] = user_rating
+    existing = profile.get("checkpoint_answered", [])
+    profile["checkpoint_answered"] = list(set(existing) | set(newly_answered))
     save_json("output/user_profile.json", profile)
 
     if accuracy > 0.75:
