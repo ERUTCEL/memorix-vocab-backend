@@ -369,13 +369,40 @@ def run_test() -> None:
     print("[AI2 TEST] 완료")
 
 
+def default_only() -> None:
+    """CSV 없이 빈 rated_words.json 생성. Oxford DB 보충은 AI4 스케줄러가 담당."""
+    refined_path = "models/refined_db.json"
+    if not os.path.exists(refined_path):
+        logger.error("AI3 먼저 실행하세요 (models/refined_db.json 없음)")
+        sys.exit(1)
+
+    output = {
+        "generated_at": datetime.now().strftime("%Y-%m-%d"),
+        "total_words": 0,
+        "oxford_matched": 0,
+        "predicted": 0,
+        "api_verified": 0,
+        "stats": {"mean_rating": 0, "median_rating": 0, "std_rating": 0},
+        "words": [],
+    }
+    os.makedirs("output", exist_ok=True)
+    with open("output/rated_words.json", "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+
+    logger.info("CSV 없음 — 빈 rated_words.json 생성 완료.")
+    print("[AI2] 기본 단어 DB 생성 완료 (단어 0개, Oxford 보충은 스케줄러가 처리)")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AI2: 유저 CSV 레이팅 예측")
     parser.add_argument("--input", default="input/user_words.csv", help="입력 CSV 경로")
+    parser.add_argument("--default-only", action="store_true", help="CSV 없이 빈 rated_words.json 생성")
     parser.add_argument("--test", action="store_true", help="단독 기능 테스트")
     args = parser.parse_args()
 
     if args.test:
         run_test()
+    elif args.default_only:
+        default_only()
     else:
         main(args.input)

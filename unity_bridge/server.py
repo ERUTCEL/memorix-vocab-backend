@@ -124,6 +124,29 @@ def health():
     }
 
 
+@app.post("/api/init-default")
+def init_default():
+    """CSV 없이 Oxford 기본 단어만으로 rated_words.json 생성"""
+    if (ROOT / "output/rated_words.json").exists():
+        rated = load_json("output/rated_words.json")
+        return {
+            "status": "already_exists",
+            "total_words": rated["total_words"],
+            "oxford_matched": rated["oxford_matched"],
+            "predicted": rated.get("predicted", 0),
+        }
+    result = run_script("scripts/ai2_rate_csv.py", "--default-only", timeout=600)
+    if result.returncode != 0:
+        raise HTTPException(500, detail=result.stderr or "기본 단어 DB 생성 실패")
+    rated = load_json("output/rated_words.json")
+    return {
+        "status": "ok",
+        "total_words": rated["total_words"],
+        "oxford_matched": rated["oxford_matched"],
+        "predicted": rated.get("predicted", 0),
+    }
+
+
 @app.post("/api/upload-csv")
 async def upload_csv(file: UploadFile = File(...)):
     """유저 CSV 업로드 → AI2 실행"""
@@ -582,7 +605,6 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", default="0.0.0.0")
     args = parser.parse_args()
-
     if args.test:
         print("[SERVER TEST] 상태 확인")
         checks = {
@@ -592,9 +614,5 @@ if __name__ == "__main__":
             "output/daily_schedule.json": (ROOT / "output/daily_schedule.json").exists(),
         }
         for path, ok in checks.items():
-            print(f"  {'✓' if ok else '✗'} {path}")
-        print("[SERVER TEST] 완료. 서버 실행:")
-        print(f"  uvicorn unity_bridge.server:app --host {args.host} --port {args.port} --reload")
-    else:
-        import uvicorn
-        uvicorn.run(app, host=args.host, port=args.port)
+            print(f"  {'ok' if ok else 'missing'} {path}")
+        print(f"[SERVER TEST] 완료. uvicorn unity_bridge.server:app --host {args.host} --port {args.port} --reload")

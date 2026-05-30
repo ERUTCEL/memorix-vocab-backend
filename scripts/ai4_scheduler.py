@@ -157,7 +157,8 @@ def get_k_factor(total_sessions: int) -> int:
 def update_user_rating(user_rating: int, word_rating: int, correct: bool, k: int) -> int:
     expected = 1.0 / (1.0 + math.exp(-(user_rating - word_rating) / 150.0))
     actual = 1 if correct else 0
-    return round(user_rating + k * (actual - expected))
+    new_rating = round(user_rating + k * (actual - expected))
+    return max(1, min(1000, new_rating))
 
 
 def calculate_daily_limit(total_words: int, days: int, avg_review_ratio: float = 0.4) -> int:
@@ -359,13 +360,19 @@ def build_daily_schedule(rated_words: dict, user_profile: dict, daily_limit: int
         "date": today_str,
         "user_rating": user_rating,
         "total_words": len(review_words) + len(new_from_csv) + len(supplement),
-        "new_words": [{"word": w["word"], "rating": w["rating"], "type": "new"} for w in new_from_csv],
+        "new_words": [
+            {"word": w["word"], "rating": w["rating"], "pos": w.get("pos"), "meaning": w.get("meaning"), "type": "new"}
+            for w in new_from_csv
+        ],
         "review_words": [
-            {"word": w["word"], "rating": w["rating"], "type": "review", "fsrs_due": w["fsrs"]["due_date"]}
+            {
+                "word": w["word"], "rating": w["rating"], "pos": w.get("pos"), "meaning": w.get("meaning"),
+                "type": "review", "fsrs_due": w["fsrs"]["due_date"],
+            }
             for w in review_words
         ],
         "db_supplement": [
-            {"word": w["word"], "rating": w["rating_refined"], "type": "supplement"}
+            {"word": w["word"], "rating": w["rating_refined"], "pos": w.get("pos"), "meaning": w.get("meaning"), "type": "supplement"}
             for w in supplement
         ],
         "stats": {
@@ -395,6 +402,28 @@ def process_session_result(session_path: str) -> dict:
     today = date.today()
 
     word_map = {w["word"]: w for w in rated_words["words"]}
+
+    # Oxford DB 보충 단어가 word_map에 없으면 자동 추가
+    oxford_path = "models/refined_db.json"
+    if os.path.exists(oxford_path):
+        with open(oxford_path, "r", encoding="utf-8") as f:
+            oxford_db = json.load(f)
+        oxford_map = {w["word"]: w for w in oxford_db["words"]}
+        for result in session.get("answers", []):
+            word = result.get("word", "").lower().strip()
+            if word not in word_map and word in oxford_map:
+                ox = oxford_map[word]
+                new_entry = {
+                    "word": word, "pos": ox.get("pos"), "meaning": ox.get("meaning"),
+                    "rating": ox["rating_refined"], "source": "oxford_supplement",
+                    "confidence": 1.0, "learned": False,
+                    "fsrs": {"stability": None, "difficulty": None, "due_date": None,
+                             "review_count": 0, "last_rating": None,
+                             "state": "new", "first_exposure": False},
+                }
+                rated_words["words"].append(new_entry)
+                word_map[word] = new_entry
+
     k = get_k_factor(user_profile["total_sessions"])
     checkpoint_answered = set(user_profile.get("checkpoint_answered", []))
     correct_count = 0
@@ -404,6 +433,8 @@ def process_session_result(session_path: str) -> dict:
         word = result.get("word", "").lower().strip()
         rating_given = int(result.get("rating_given", 3))
         correct = result.get("correct")
+        if correct is None:
+            correct = rating_given > 1
 
         if word not in word_map:
             logger.warning(f"세션 결과에 없는 단어: {word}")

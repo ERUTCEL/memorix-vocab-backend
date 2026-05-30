@@ -69,6 +69,27 @@ def generate_quiz(rated_words_path: str = "output/rated_words.json") -> None:
         data = json.load(f)
 
     words = data["words"]
+
+    # 단어 풀이 부족하면 Oxford DB로 보충
+    if len(words) < QUESTIONS_PER_BUCKET * len(BUCKETS):
+        oxford_path = "models/refined_db.json"
+        if os.path.exists(oxford_path):
+            logger.info("단어 풀 부족 — Oxford DB에서 퀴즈 단어 보충")
+            with open(oxford_path, "r", encoding="utf-8") as f:
+                oxford_data = json.load(f)
+            existing_words = {w["word"] for w in words}
+            for w in oxford_data["words"]:
+                if w["word"] not in existing_words:
+                    words.append({
+                        "word": w["word"],
+                        "rating": w["rating_refined"],
+                        "pos": w.get("pos"),
+                        "meaning": w.get("meaning"),
+                    })
+                    existing_words.add(w["word"])
+        else:
+            logger.error("Oxford DB 없음 (models/refined_db.json). AI3 먼저 실행하세요.")
+            sys.exit(1)
     questions = []
     order = 1
 
@@ -258,6 +279,20 @@ def cat_start(rated_words_path: str = "output/rated_words.json") -> None:
 
     theta = 400.0
     words = [{"word": w["word"], "rating": w["rating"]} for w in data["words"]]
+
+    # 단어 풀 부족 시 Oxford DB 보충
+    if len(words) < 10:
+        oxford_path = "models/refined_db.json"
+        if os.path.exists(oxford_path):
+            logger.info("CAT 단어 풀 부족 — Oxford DB 보충")
+            with open(oxford_path, "r", encoding="utf-8") as f:
+                oxford_data = json.load(f)
+            existing = {w["word"] for w in words}
+            for w in oxford_data["words"]:
+                if w["word"] not in existing:
+                    words.append({"word": w["word"], "rating": w["rating_refined"]})
+                    existing.add(w["word"])
+
     first = _select_next_item(theta, words, set())
 
     if first is None:
