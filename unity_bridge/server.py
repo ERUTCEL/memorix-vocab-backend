@@ -41,8 +41,11 @@ QUESTIONS_PER_BUCKET = 20
 # ── Startup ──────────────────────────────────────────────────────────────────
 
 def startup() -> None:
-    Base.metadata.create_all(bind=engine)
-    _seed_oxford_if_empty()
+    try:
+        Base.metadata.create_all(bind=engine)
+        _seed_oxford_if_empty()
+    except Exception as e:
+        print(f"[STARTUP] DB 초기화 실패 (나중에 재시도 가능): {e}")
 
 
 def _seed_oxford_if_empty() -> None:
